@@ -70,4 +70,4 @@ If you use TokenSim in your research, please cite our paper:
 ## Acknowledgments
 
 - Thanks to all contributors who have helped shape TokenSim
-- Special thanks to the SimPy community for their excellent discrete-event simulation libraryThis is my update.
+- Special thanks to the SimPy community for their excellent discrete-event simulation library
