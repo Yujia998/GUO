@@ -157,6 +157,7 @@ class LLMWorker(Worker):
                     lazy_swap=self.lazy_swap,
                     max_parallem_sum=max_parallem_sum,
                     max_occupy_ratio=max_occupy_ratio if self.role != "prompt" else 1,
+                    shared_cache=psla_config.shared_cache,
                 )
         elif batching == "static":
             self.scheduler = LLMStaticScheduler(max_parallem_sum=max_parallem_sum)
@@ -367,6 +368,10 @@ class LLMWorker(Worker):
             total_time = total_time * 1.41 + 0.009
         else:
             total_time = total_time / 0.55
+
+        # Reduce latency for cache hits
+        if all(getattr(req, 'cache_hit', False) for req in requests):
+            total_time = total_time / 10  # 10x speedup for cache hits
         return total_time
 
     def dynamic_batch_llmcompass(self, requests: list[Request]) -> float:
@@ -430,6 +435,10 @@ class LLMWorker(Worker):
                 sum_attn_latency += attn * 40
         # Calibration
         total_time = proj_latency + sum_attn_latency
+
+        # Reduce latency for cache hits
+        if all(getattr(req, 'cache_hit', False) for req in requests):
+            total_time = total_time / 10  # 10x speedup for cache hits
         return total_time
 
 
