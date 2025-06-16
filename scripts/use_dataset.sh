@@ -6,7 +6,7 @@
     --swap_policy eager \
     --prompt_count 100 \
     --cluster ./data/clusters/1_a100/h1.json \
-    --dataset_json_path ./data/llmb_ver.json \
+    --dataset_json_path ./dataset/example.json \
     --qps 50 \
     --max_parallem_sum 100 \
     --verbose none \
