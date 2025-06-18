@@ -5,15 +5,29 @@ import requests
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from pathlib import Path
+import kagglehub
+from pathlib import Path
+import json
 from huggingface_hub import login
 import ijson
+from kaggle.api.kaggle_api_extended import KaggleApi
+import argparse
+import itertools
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--max_total_entries", type=int, default=1000000, help="Max total entries across all files")
+parser.add_argument("--max_entries_per_file", type=int, default=20000, help="Max entries per JSONL file")
+parser.add_argument("--language", type=str, default="en", help="Filter entries by language (e.g., 'en' or 'fr')")
+args = parser.parse_args()
+
+ 
 # Authenticate Hugging Face API
-
+login(token="")
 try:
     from datasets import load_dataset
     HUGGINGFACE_AVAILABLE = True
-except ImportError:
+except ImportError as ex:
+    print(ex)
     HUGGINGFACE_AVAILABLE = False
 
 try:
@@ -25,11 +39,11 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from TokenSim.utils import get_generation_lens
 
 DATASETS = {
-   # "longbench": ("longbench_input.json", "THUDM/LongBench-v2"),
+    "longbench": ("longbench_input.json", "THUDM/LongBench-v2"),
    # "needle_in_a_haystack": ("haystack.json", None),
-   # "sharegpt": ("sharegpt.json", None),
+   "sharegpt": ("sharegpt.json", None),
    "bookcorpus": ("bookcorpus.json", None),  # Use Kaggle local JSONL
-   # "wikipedia_structured": ("wiki.json", None),
+   "wikipedia_structured": ("wiki.json", None),
 }
 
 MODELS = {
@@ -63,8 +77,13 @@ def extract_prompt(dataset_name, entry):
         except Exception:
             return ""
         return entry.get("prompt", "")
-    elif dataset_name in ["bookcorpus", "wikipedia_structured"]:
+    elif dataset_name == "bookcorpus":
         return entry.get("text", "")
+    elif dataset_name == "wikipedia_structured":
+         return entry.get("text", "")
+        # Extract paragraph text from nested sections
+        #sections = entry.get("sections", [])
+        #return extract_section_text(sections)
     return ""
 
 def fallback_sharegpt_stream():
@@ -89,11 +108,39 @@ def load_bookcorpus_local():
                 line = line.strip()
                 if line:
                     yield {"text": line}
+def extract_section_text(sections):
+    """Extract all paragraph text from nested section structures."""
+    all_text = []
+    for sec in sections:
+        if not isinstance(sec, dict):
+            continue
+        # Use a stack to walk through nested 'has_parts'
+        stack = [sec]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                if item.get("type") == "paragraph":
+                    val = item.get("value", "").strip()
+                    if val:
+                        all_text.append(val)
+                # Continue traversal if nested
+                if "has_parts" in item:
+                    stack.extend(item["has_parts"])
+    return "\n\n".join(all_text).strip()
+
 
 # MAIN LOOP
 for dataset_name, (local_filename, hf_id) in DATASETS.items():
     local_path = Path("dataset") / dataset_name / local_filename
     dataset_data = None
+    print(hf_id)
+    print(HUGGINGFACE_AVAILABLE)
+    if hf_id and HUGGINGFACE_AVAILABLE:
+            try:
+                print(f"📡 Trying to load {dataset_name} from Hugging Face: {hf_id}")
+                dataset_data = load_dataset(hf_id, split="train")
+            except Exception as e:
+                print(f"⚠️  Hugging Face load failed for {hf_id}, fallback to local: {e}")
 
     if dataset_name == "sharegpt":
         print("🔁 Always using fallback loader for ShareGPT...")
@@ -102,40 +149,108 @@ for dataset_name, (local_filename, hf_id) in DATASETS.items():
         print(f"📦 Loading local BookCorpus .txt files...")
         dataset_data = load_bookcorpus_local()
         
+    
     elif dataset_name == "wikipedia_structured":
         try:
-            print("📡 Downloading Wikipedia Structured from Kaggle via kagglehub...")
-            kaggle_path = kagglehub.dataset_download("wikimedia-foundation/wikipedia-structured-contents")
-            file_path = Path(kaggle_path) / "enwiki-20240520-cirrussearch-content.json"
-            if file_path.exists():
-                with open(file_path, "r", encoding="utf-8") as f:
-                    dataset_data = [json.loads(line) for line in f if line.strip()]
+            print("📡 Checking for Wikipedia Structured dataset via kagglehub...")
+
+            expected_cache_path = (
+                Path.home() / ".cache" / "kagglehub" / "datasets" /
+                "wikimedia-foundation" / "wikipedia-structured-contents" / "versions" / "1" 
+            )
+
+            if expected_cache_path.exists():
+                print("✅ Wikipedia Structured already exists locally.")
+                dataset_dir = expected_cache_path
             else:
-                print(f"❌ File not found at expected location: {file_path}")
+                print("⬇️ Downloading Wikipedia Structured from Kaggle...")
+                dataset_dir = Path(kagglehub.dataset_download("wikimedia-foundation/wikipedia-structured-contents"))
+                print("✅ Path to dataset files:", dataset_dir)
+
+            jsonl_files = list(dataset_dir.rglob("*.jsonl"))
+            if not jsonl_files:
+                print(f"❌ No JSONL files found in {dataset_dir}")
                 continue
-        except Exception as e:
-            print(f"❌ Failed to load Wikipedia Structured from Kaggle: {e}")
-            continue
-    elif hf_id and HUGGINGFACE_AVAILABLE:
-        try:
-            print(f"📡 Loading {dataset_name} from Hugging Face: {hf_id}")
-            dataset_data = load_dataset(hf_id, split="train", streaming=True,download_mode="force_redownload")
-        except Exception as e:
-            print(f"⚠️ HF load failed for {hf_id}: {e}")
 
-    if dataset_data is None:
-        if local_path.exists():
-            print(f"📂 Loading {dataset_name} from local: {local_path}")
-            with open(local_path, "r", encoding="utf-8") as f:
-                dataset_data = json.load(f)
-        elif dataset_name == "needle_in_a_haystack":
-            print("❌ Skipping needle_in_a_haystack: no data found")
-            continue
-        else:
-            print(f"❌ Skipping {dataset_name}: no data found")
+            print(f"✅ Found {len(jsonl_files)} JSONL files. Streaming with:")
+            print(f"   🔸 max_total_entries = {args.max_total_entries}")
+            print(f"   🔸 max_entries_per_file = {args.max_entries_per_file}")
+            print(f"   🔸 language filter = {args.language}")
+
+            def wikipedia_generator(max_total_entries, max_entries_per_file, language_filter):
+                total_count = 0
+                for file_path in jsonl_files:
+                    print(f"📂 Reading file: {file_path.name}")
+                    local_count = 0
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        for line_num, line in enumerate(f):
+                            if total_count >= max_total_entries or local_count >= max_entries_per_file:
+                                break
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                obj = json.loads(line)
+
+                                # ✅ Language fallback (assume 'en' if missing)
+                               # lang = obj.get("language", "en")
+                                #if lang != language_filter:
+                                    #continue
+
+                                # ✅ Extract paragraph text from sections (no raw "text" field available)
+                                sections = obj.get("sections", [])
+                                text = extract_section_text(sections)
+
+                                if not text or len(text) <= 0:
+                                    #print(f"⚠️ [Line {line_num}] Skipped: no paragraph text or too short ({len(text)} chars)")
+                                    continue
+
+                                yield {"text": text}
+                                total_count += 1
+                                local_count += 1
+
+                                if total_count % 100 == 0:
+                                    print(f"✅ Yielded {total_count} valid prompts")
+
+                            except Exception as e:
+                                print(f"❌ [Line {line_num}] JSON error: {e}")
+                                continue
+
+                    if total_count >= max_total_entries:
+                        break
+
+
+            dataset_data = list(itertools.islice(
+                                    wikipedia_generator(
+                                        max_total_entries=args.max_total_entries,
+                                        max_entries_per_file=args.max_entries_per_file,
+                                        language_filter=args.language
+                                    ),
+            args.max_total_entries  # preload into memory only this many
+                ))
+            print(f"✅ Loaded {len(dataset_data)} prompt entries into memory.")
+           # print("🔍 First few entries from dataset_data:")
+            for i, entry in enumerate(dataset_data[:5]):
+                print(f"Entry {i + 1}:", entry)
+
+
+        except Exception as e:
+            print(f"❌ Failed to load Wikipedia Structured from kagglehub: {e}")
             continue
 
-    print(f"✅ Loaded dataset: {dataset_name}")
+        if dataset_data is None:
+            if local_path.exists():
+                print(f"📂 Loading {dataset_name} from local: {local_path}")
+                with open(local_path, "r", encoding="utf-8") as f:
+                    dataset_data = json.load(f)
+            elif dataset_name == "needle_in_a_haystack":
+                print("❌ Skipping needle_in_a_haystack: no data found")
+                continue
+            else:
+                print(f"❌ Skipping {dataset_name}: no data found")
+                continue
+
+        print(f"✅ Loaded dataset: {dataset_name}")
 
     for model_name, tokenizer_id in MODELS.items():
         output_path = Path("dataset") / dataset_name / "converted" / f"{model_name}.json"
@@ -144,7 +259,7 @@ for dataset_name, (local_filename, hf_id) in DATASETS.items():
             continue
 
         print(f"\n🚀 Tokenizing with {model_name}: {tokenizer_id}")
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, trust_remote_code=True)
         
         prompt_lens = []
         entry_count = 0
