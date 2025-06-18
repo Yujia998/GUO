@@ -145,7 +145,6 @@ def export_result(
     notdone: list[int],
     duration: float,
     engine: LLMEngine = None,  # Add engine parameter
-   # cache_stats: engine.cache_stats if hasattr(engine, "cache_stats") else None
 ):
     request_time = MetricData.from_list(g_time.request_time)
     prompt_time = MetricData.from_list(g_time.prompt_time)
@@ -155,8 +154,7 @@ def export_result(
     cache_stats = None
     if engine:
         for worker in engine.workers:
-            #if hasattr(worker.scheduler, 'block_manager') and worker.scheduler.block_manager.shared_cache:
-            if hasattr(worker.scheduler, 'block_manager'):
+            if hasattr(worker.scheduler, 'block_manager') and worker.scheduler.block_manager.shared_cache:
                 cache_stats = worker.scheduler.block_manager.get_cache_stats()
                 break
 
