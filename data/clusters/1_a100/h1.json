@@ -8,7 +8,8 @@
             "role": "homo",
             "hardware": "A100-40G",
             "num_workers": 1,
-            "network": "netw1"
+            "network": "netw1",
+            "shared_cache": true
         }
     ]
 }

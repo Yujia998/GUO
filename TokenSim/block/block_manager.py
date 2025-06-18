@@ -116,6 +116,9 @@ class BlockManager:
         total = self.cache_hits + self.cache_misses
         hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
         
+        if self.debug:
+            print(f"[DEBUG] Cache stats: hits={self.cache_hits}, misses={self.cache_misses}, hit_rate={hit_rate:.2f}%")
+        
         return {
             "hits": self.cache_hits,
             "misses": self.cache_misses,
