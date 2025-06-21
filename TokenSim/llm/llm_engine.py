@@ -115,11 +115,13 @@ class LLMWorker(Worker):
         swap_policy: SwapPolicy,
         roofline: TransformerRoofline,
         max_parallem_sum: int,
+        eviction_policy: str,
         max_occupy_ratio: float = 1,
         pp_dim: int = 1,
         wrapped_llmcompass_vars: Tuple[
             LLMCompassSystem, TransformerBlockInitComputationTP, TransformerBlockAutoRegressionTP
         ] = None,
+       
     ):
         super().__init__(env, id)
         self.llmcm_system, self.llmcm_prefill, self.llmcm_decode = None, None, None
@@ -136,8 +138,8 @@ class LLMWorker(Worker):
 
         self.block_size = block_size
         self.swap_policy = swap_policy
-
-        self.cache_config = CacheConfig(self.block_size, self.hardware, self.model, self.roofline)
+        self.eviction_policy = eviction_policy
+        self.cache_config = CacheConfig(self.block_size, self.hardware, self.model, self.roofline,debug=True)
 
         self.preempted_cnt = 0
 
@@ -151,6 +153,7 @@ class LLMWorker(Worker):
                 # if self.role == "prompt":
                 self.scheduler = LLMPromptScheduler(max_parallem_sum=200)
             else:
+                print(f"Worker {self.id} using paged attention scheduler")
                 self.scheduler = LLMPagedAttnScheduler(
                     self.id,
                     cache_config=self.cache_config,
@@ -158,13 +161,17 @@ class LLMWorker(Worker):
                     max_parallem_sum=max_parallem_sum,
                     max_occupy_ratio=max_occupy_ratio if self.role != "prompt" else 1,
                     shared_cache=psla_config.shared_cache,
+                    #swap_policy=swap_policy,
+                    eviction_policy=eviction_policy,
                 )
+                
         elif batching == "static":
             self.scheduler = LLMStaticScheduler(max_parallem_sum=max_parallem_sum)
         else:
             self.scheduler = LLMDynamicScheduler(max_parallem_sum=max_parallem_sum)
 
         self.status = WorkerStatus.WAITING
+        self.eviction_policy = eviction_policy
         self.action = self.env.process(self.run())
 
     @property
@@ -493,11 +500,13 @@ class LLMEngine(Worker):
         pworker_pool_type: str,
         gworker_pool_type: str,
         max_parallem_sum: int,
+        eviction_policy: str,
         max_occupy_ratio: float = 1,
         pp_dim: int = 1,
         wrapped_llmcompass_vars: Tuple[
             LLMCompassSystem, TransformerBlockInitComputationTP, TransformerBlockAutoRegressionTP
         ] = None,
+        
     ):
         super().__init__(env, -1)
 
@@ -518,9 +527,11 @@ class LLMEngine(Worker):
                 swap_policy,
                 roofline,
                 max_parallem_sum,
+                eviction_policy,
                 max_occupy_ratio,
                 pp_dim,
                 wrapped_llmcompass_vars,
+              
             )
             for id, worker_config in enumerate(cluster_config.workers())
         ]
@@ -533,8 +544,9 @@ class LLMEngine(Worker):
                 for worker in self.workers
                 if worker.role == "homo" or worker.role == "generation"
             ]
+            
         )
-
+        
         self.memory_usage_trace = []
 
         self.action = self.env.process(self.run())
@@ -568,9 +580,11 @@ class LLMEngine(Worker):
     def run(self):
         while True:
             msg = yield self.msg_queue.get()
+             
             match msg.task:
                 case Task.ADD:
                     worker = self.pworkers.schedule()
+                    
                     self.send_task(worker, Task.ADD, msg.requests)
                     self.trace_all_memory_usage()
                 # 3. 内存交换
