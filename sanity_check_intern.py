@@ -2,7 +2,7 @@
 from transformers import AutoModelForCausalLM
 
 model = AutoModelForCausalLM.from_pretrained(
-    "internlm/internlm2-7b",
+    "mistralai/Mistral-7B",
     trust_remote_code=True
 )
-print("loaded InternLM2-7B with trust_remote_code=True")
+print("loaded Mistral-7B with trust_remote_code=True")
