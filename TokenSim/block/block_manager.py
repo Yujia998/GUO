@@ -1,6 +1,7 @@
 from TokenSim.llm.llm_request import Request
 from TokenSim.block.block import Device, PhysicalTokenBlock
-from typing import Tuple
+from TokenSim.block.shared_cache import SharedMemoryCache, SharedMemoryCacheLFU
+from typing import Tuple, Dict, Set, Optional
 
 
 class BlockAllocator:
@@ -13,39 +14,54 @@ class BlockAllocator:
 
     def __init__(
         self,
-        device: Device,
-        block_size: int,
         num_blocks: int,
     ) -> None:
-        self.device = device
-        self.block_size: int = block_size
         self.num_blocks: int = num_blocks
+        self.free_blocks = set(range(num_blocks))
 
-        # Initialize the free blocks.
-        self.num_free_blocks: int = self.num_blocks
+    def allocate(self) -> int | None:
+        """Allocate a block ID.
+        
+        Returns:
+            int | None: The allocated block ID, or None if no blocks are available.
+        """
+        if not self.free_blocks:
+            return None
+        return self.free_blocks.pop()
 
-    def allocate(self) -> PhysicalTokenBlock:
-        if self.num_free_blocks == 0:
-            raise ValueError("Out of memory! No free blocks are available.")
-        self.num_free_blocks -= 1
-        return PhysicalTokenBlock(self.device, 0, self.block_size)
-
-    def free(self) -> None:
-        self.num_free_blocks += 1
+    def free(self, block_id: int) -> None:
+        """Free a block ID.
+        
+        Args:
+            block_id: The ID of the block to free.
+        """
+        self.free_blocks.add(block_id)
 
     def get_num_free_blocks(self) -> int:
-        return self.num_free_blocks
+        """Get the number of free blocks.
+        
+        Returns:
+            int: The number of free blocks.
+        """
+        return len(self.free_blocks)
 
     def get_num_allocated_blocks(self) -> int:
-        return self.num_blocks - self.num_free_blocks
+        """Get the number of allocated blocks.
+        
+        Returns:
+            int: The number of allocated blocks.
+        """
+        return self.num_blocks - len(self.free_blocks)
 
-    def set_num_free_blocks(self, block_num):
-        self.num_free_blocks = block_num
-
-    def get_status(self) -> Tuple[int, int, int]:
+    def get_status(self) -> tuple[int, int, int]:
+        """Get the status of the allocator.
+        
+        Returns:
+            tuple[int, int, int]: A tuple containing (free_blocks, allocated_blocks, total_blocks).
+        """
         return (
-            self.num_free_blocks,
-            self.num_blocks - self.num_free_blocks,
+            len(self.free_blocks),
+            self.num_blocks - len(self.free_blocks),
             self.num_blocks,
         )
 
@@ -56,94 +72,491 @@ class BlockManager:
         block_size: int,
         num_gpu_blocks: int,
         num_cpu_blocks: int,
-        watermark: float = 0.01,
+        shared_cache: bool = False,
+        eviction_policy: str = "lru",  # "lru" or "lfu"
+        debug: bool = False,
     ):
         self.block_size = block_size
-        self.num_total_gpu_blocks = num_gpu_blocks
-        self.num_total_cpu_blocks = num_cpu_blocks
+        self.shared_cache = shared_cache
+        self.debug = debug
+        self.eviction_policy = eviction_policy
+        # Convert to integers to avoid type errors
+        num_gpu_blocks = int(num_gpu_blocks)
+        num_cpu_blocks = int(num_cpu_blocks)
 
-        self.watermark_blocks = int(watermark * num_gpu_blocks)
-        self.gpu_allocator = BlockAllocator(Device.GPU, block_size, num_gpu_blocks)
-        self.cpu_allocator = BlockAllocator(Device.CPU, block_size, num_cpu_blocks)
+        # Initialize GPU and CPU blocks
+        self.gpu_blocks = {
+            i: PhysicalTokenBlock(Device.GPU, i, block_size)
+            for i in range(num_gpu_blocks)
+        }
+        self.cpu_blocks = {
+            i: PhysicalTokenBlock(Device.CPU, i, block_size)
+            for i in range(num_cpu_blocks)
+        }
+
+        # Initialize allocators
+        self.gpu_allocator = BlockAllocator(num_gpu_blocks)
+        self.cpu_allocator = BlockAllocator(num_cpu_blocks)
+
+        # Initialize SharedMemoryCache for LRU eviction
+        if self.shared_cache:
+            # Use GPU blocks as cache capacity
+            if self.eviction_policy  == "lru":
+                # LFU requires a frequency map, so we initialize it
+                print(f"[BlockManager] Using SharedMemoryCache with {self.eviction_policy} eviction policy")
+                self.shared_memory_cache = SharedMemoryCache(capacity=num_gpu_blocks)
+            else:
+
+                self.shared_memory_cache = SharedMemoryCacheLFU(capacity=num_gpu_blocks)
+            # Map token sequences to list of block IDs for tracking
+            self.token_to_block_map: Dict[tuple, list[int]] = {}
+        else:
+            self.shared_memory_cache = None
+            self.token_to_block_map = {}
+
+        # Legacy cache statistics (kept for backward compatibility)
+        self.cache_hits = 0
+        self.cache_misses = 0
+
+        if self.debug or True:
+            print(f"[BlockManager] shared_cache={self.shared_cache}, debug={self.debug} eviction_policy={self.eviction_policy}")
+
+    def get_cache_stats(self) -> dict:
+        """Get cache hit/miss statistics.
+        
+        Returns:
+            dict: A dictionary containing cache statistics including:
+                - hits: Number of cache hits
+                - misses: Number of cache misses
+                - hit_rate: Cache hit rate as a percentage
+                - total: Total number of allocations
+                - evictions: Number of cache evictions (if using SharedMemoryCache)
+        """
+        if self.shared_cache and self.shared_memory_cache:
+            # Use SharedMemoryCache statistics
+            cache_stats = self.shared_memory_cache.get_stats()
+            
+            return {
+                "hits": cache_stats.hits,
+                "misses": cache_stats.misses,
+                "hit_rate": cache_stats.hit_rate * 100,  # Convert to percentage
+                "total": cache_stats.total_accesses,
+                "evictions": cache_stats.evictions
+            }
+        else:
+            # Use legacy statistics
+            total = self.cache_hits + self.cache_misses
+            hit_rate = (self.cache_hits / total * 100) if total > 0 else 0
+            
+            return {
+                "hits": self.cache_hits,
+                "misses": self.cache_misses,
+                "hit_rate": hit_rate,
+                "total": total,
+                "evictions": 0
+            }
+
+    def get_num_free_blocks(self, device: Device) -> int:
+        return sum(1 for b in self.device_blocks[device] if b.ref_count == 0)
 
     def can_allocate(self, req: Request) -> bool:
-        num_required_blocks = req.num_logical_token_blocks
-        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
-        return num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks
+        """Check if we can allocate blocks for a request."""
+        num_blocks = (req.prompt_len + req.block_size - 1) // req.block_size
+        if self.debug:
+            print(f"can_allocate: required_blocks={num_blocks}, free_gpu_blocks={self.gpu_allocator.get_num_free_blocks()}")
+        
+        # If using SharedMemoryCache, we can always allocate (eviction will handle capacity)
+        if self.shared_cache and self.shared_memory_cache:
+            num_blocks = (req.prompt_len + req.block_size - 1) // req.block_size
+            if num_blocks > self.gpu_allocator.num_blocks:
+               # print(f"[Blocked] Request {req.id} needs {num_blocks} blocks, but only {self.gpu_allocator.num_blocks} exist in total.")
+                return True
+            return True
+        
+        #print(f"can_allocate: num_blocks={num_blocks}, free_gpu_blocks={self.gpu_allocator.get_num_free_blocks()}")
+        # Otherwise, check if we have enough free blocks
+        return self.gpu_allocator.get_num_free_blocks() >= num_blocks
 
-    def allocate(self, req: Request):
-        # Allocate new physical token blocks that will store the prompt&generated tokens.
-        for _ in range(req.num_logical_token_blocks):
-            block = self.gpu_allocator.allocate()
+    def allocate(self, req: Request) -> None:
+        """Allocate blocks for a request."""
+        if self.debug:
+            print(f"allocate: allocating blocks for request {req.id}")
+            print(f"Prompt length: {req.prompt_len}, Block size: {req.block_size}")
+
+        if self.shared_cache and self.shared_memory_cache:
+            # Use SharedMemoryCache for LRU eviction
+            self._allocate_with_shared_cache(req)
+        else:
+            # Use legacy allocation method
+            print(f"[BlockManager] Using legacy allocation method for request {req.id}")
+            self._allocate_legacy(req)
+
+    def _allocate_with_shared_cache(self, req: Request) -> None:
+        """Allocate blocks using SharedMemoryCache with LRU eviction."""
+        #print(f"Allocating blocks for request {req.id} with SharedMemoryCache")
+        req_tokens = req.get_token_sequence()
+        #print(f"Request tokens: {req_tokens}")
+        # Try to get from cache first
+        cached_tokens = self.shared_memory_cache.get(req_tokens)
+       # print(f"Cached tokens: {cached_tokens}")
+        if cached_tokens is not None:
+            print(f"Cache hit for request {req.id} with tokens {req_tokens}")
+            # Cache hit - reuse existing blocks
+            if self.debug:
+                print(f"Cache hit for request {req.id}")
+            
+            # Find the blocks that were previously allocated for this token sequence
+            if req_tokens in self.token_to_block_map:
+                block_ids = self.token_to_block_map[req_tokens]
+                for block_id in block_ids:
+                    if block_id in self.gpu_blocks:
+                        block = self.gpu_blocks[block_id]
+                        req._append_physical_block(block)
+                        block.ref_count += 1
+                req.cache_hit = True
+                return
+            
+            # If block not found, treat as miss
+            if self.debug:
+                print(f"Block not found for cached tokens, treating as miss")
+        
+        # Cache miss - allocate new blocks
+        if self.debug:
+            print(f"Cache miss for request {req.id}, allocating new blocks")
+        
+        num_blocks = (req.prompt_len + req.block_size - 1) // req.block_size
+        #print(f"Number of blocks to allocate: {num_blocks}")
+        # Check if we need to evict blocks due to capacity constraints
+        #print(f"Free GPU blocks before allocation: {self.gpu_allocator.get_num_free_blocks()}")
+        if self.gpu_allocator.get_num_free_blocks() < num_blocks:
+            # Need to evict some blocks to make space
+            blocks_to_evict = num_blocks - self.gpu_allocator.get_num_free_blocks()
+            #print(f"Evicting {blocks_to_evict} blocks to make space for allocation")
+            self._evict_blocks(blocks_to_evict)
+        
+        # Allocate new blocks
+        allocated_block_ids = []
+        for _ in range(num_blocks):
+            block_id = self.gpu_allocator.allocate()
+            
+            if block_id is None:
+                print(f"Failed to allocate block for request {req.id}")
+                raise RuntimeError("Failed to allocate GPU block")
+            allocated_block_ids.append(block_id)
+            block = self.gpu_blocks[block_id]
             req._append_physical_block(block)
+            block.ref_count = 1
+            block.tokens = req_tokens
+        
+        # Store the list of block IDs for this token sequence
+        if allocated_block_ids:
+            self.token_to_block_map[req_tokens] = allocated_block_ids
+        
+        # Add to shared cache
+        self.shared_memory_cache.put(req_tokens, allocated_block_ids)
+        req.cache_hit = False
 
-    def get_gpu_status(self) -> Tuple[int, int, int]:
-        return self.gpu_allocator.get_status()
+    def _allocate_legacy(self, req: Request) -> None:
+        """Legacy allocation method without SharedMemoryCache."""
+        # First try to find a shared block
+        shared_block = self._find_shared_block(req)
+        print
+        if shared_block is not None:
+            if self.debug:
+                print(f"Found shared block {shared_block.block_number}")
+            self.cache_hits += 1
+            req._append_physical_block(shared_block)
+            shared_block.ref_count += 1
+            req.cache_hit = True
+            return
 
-    def free(self, req: Request):
-        # only handle when request finishes normally.
-        # If abnormal case happens, e.g., aborted during SWAPPED status, block_table is needed.
-        for _ in range(req.num_physical_token_blocks):
-            self.gpu_allocator.free()
+        # If no shared block found, allocate new blocks
+        self.cache_misses += 1
+        req.cache_hit = False
+        num_blocks = (req.prompt_len + req.block_size - 1) // req.block_size
+        print(f"Number of blocks to allocate: {num_blocks}")
+        if self.debug:
+            print(f"Allocating {num_blocks} new blocks")
 
-    def can_append_slot(self, swapiness: int) -> bool:
-        """
-        swapiness is the number of free blocks before activating swap
-        Simple heuristic:
-        - eager swap: if there is at least one free block for current reqeust, we can append.
-        - lazy swap: running queue will not be changed in this step as we have watermark
-            protection. Swap happens ONLY when watermark for all running requets is exceeded.
-        """
-        num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
-        return num_free_gpu_blocks >= 1 + swapiness
-
-    def append_slot(self, req: Request):
-        """Allocate a physical slot for a new token."""
-        if req.num_physical_token_blocks < req.num_logical_token_blocks:
-            # The request has a new logical block, which
-            # happens in Scheduler.update_output_tokens().
-            # Allocate a new physical block.
-            block = self.gpu_allocator.allocate()
+        for _ in range(num_blocks):
+            block_id = self.gpu_allocator.allocate()
+            if block_id is None:
+                raise RuntimeError("Failed to allocate GPU block")
+            block = self.gpu_blocks[block_id]
             req._append_physical_block(block)
+            block.ref_count = 1
+            block.tokens = req.get_token_sequence()  # Store the token sequence
+
+    def _evict_blocks(self, num_blocks_to_evict: int) -> None:
+        """Evict blocks using LRU policy from SharedMemoryCache."""
+        if not self.shared_cache or not self.shared_memory_cache:
+            return
+        
+        # Get the LRU list from the cache
+        lru_list = self.shared_memory_cache.lru.copy()
+        
+        if self.debug:
+            print(f"Evicting {num_blocks_to_evict} blocks using LRU policy")
+            print(f"Current LRU list: {lru_list}")
+            
+        # Evict the least recently used blocks
+        evicted_blocks = 0
+        i = 0
+        while evicted_blocks < num_blocks_to_evict and i < len(lru_list):
+            token_sequence = lru_list[i]
+            
+            # Remove from cache
+            if token_sequence in self.shared_memory_cache.cache:
+                del self.shared_memory_cache.cache[token_sequence]
+                self.shared_memory_cache.stats.evictions += 1
+            
+            # Remove from LRU list
+            if token_sequence in self.shared_memory_cache.lru:
+                self.shared_memory_cache.lru.remove(token_sequence)
+            
+            # Free all associated blocks
+            if token_sequence in self.token_to_block_map:
+                block_ids = self.token_to_block_map[token_sequence]
+                for block_id in block_ids:
+                    if block_id in self.gpu_blocks:
+                        block = self.gpu_blocks[block_id]
+                        if block.ref_count > 0:
+                            block.ref_count -= 1
+                            if block.ref_count == 0:
+                                self.gpu_allocator.free(block_id)
+                                evicted_blocks += 1
+                # Remove from token mapping
+                del self.token_to_block_map[token_sequence]
+            
+            if self.debug:
+                print(f"Evicted block(s) for token sequence {token_sequence}")
+            i += 1
+ 
+    def _evict_blocksupdated(self, num_blocks_to_evict: int) -> None:
+        """Evict blocks using LRU or LFU policy from SharedMemoryCache."""
+        if not self.shared_cache or not self.shared_memory_cache:
+            return
+
+        # Choose token sequences to evict based on policy
+        if self.eviction_policy == "lfu":
+            candidate_sequences = sorted(
+                self.shared_memory_cache.freq.items(),
+                key=lambda x: x[1]  # Sort by frequency (ascending)
+            )
+            candidate_sequences = [seq for seq, _ in candidate_sequences]
+        else:  # Default to LRU
+            print(self.shared_memory_cache.__dict__)
+            candidate_sequences = self.shared_memory_cache.lru.copy()
+        print(candidate_sequences)
+        # Evict the least valuable blocks
+        evicted_blocks = 0
+        i = 0
+        while evicted_blocks < num_blocks_to_evict and i < len(candidate_sequences):
+            token_sequence = candidate_sequences[i]
+
+            if self.eviction_policy == "lru":
+                # Remove from cache
+                if token_sequence in self.shared_memory_cache.cache:
+                    del self.shared_memory_cache.cache[token_sequence]
+                # Remove from LRU list
+                if token_sequence in self.shared_memory_cache.lru:
+                    self.shared_memory_cache.lru.remove(token_sequence)
+            else:
+                 self.shared_memory_cache.freq.pop(token_sequence, None)
+
+            # Free all associated blocks
+            if token_sequence in self.token_to_block_map:
+                block_ids = self.token_to_block_map[token_sequence]
+                for block_id in block_ids:
+                    if block_id in self.gpu_blocks:
+                        block = self.gpu_blocks[block_id]
+                        if block.ref_count > 0:
+                            block.ref_count -= 1
+                            if block.ref_count == 0:
+                                self.gpu_allocator.free(block_id)
+                                evicted_blocks += 1
+                del self.token_to_block_map[token_sequence]
+
+            if self.debug:
+                print(f"Evicted token sequence: {token_sequence}")
+            i += 1
+
+    def _find_shared_block(self, req: Request) -> PhysicalTokenBlock | None:
+        """Find a shared block that can be used for this request."""
+        if not self.shared_cache:
+            return None
+
+        req_tokens = req.get_token_sequence()
+        for block in self.gpu_blocks.values():
+            if block.ref_count > 0 and getattr(block, 'tokens', None) == req_tokens:
+                return block
+        return None
+
+    def can_append_slot(self, num_blocks: int = 0) -> bool:
+        """Check if we can append a slot to the request."""
+        if self.debug:
+            print(f"can_append_slot: num_blocks={num_blocks}, free_gpu_blocks={self.gpu_allocator.get_num_free_blocks()}")
+        return self.gpu_allocator.get_num_free_blocks() >= num_blocks
+
+    def append_slot(self, req: Request) -> None:
+        """Append a new slot to the request."""
+        if self.debug:
+            print(f"append_slot: appending slot for request {req.id}")
+
+        block_id = self.gpu_allocator.allocate()
+        if block_id is None:
+            raise RuntimeError("Failed to allocate GPU block")
+        block = self.gpu_blocks[block_id]
+        req._append_physical_block(block)
+        block.ref_count = 1
 
     def can_swap_in(self, req: Request, watermark: int | None = None) -> bool:
+        """Check if we can swap in blocks for a request."""
         num_required_blocks = req.num_physical_token_blocks
         num_free_gpu_blocks = self.gpu_allocator.get_num_free_blocks()
-        if watermark:
+        
+        if self.debug:
+            print(f"can_swap_in: required_blocks={num_required_blocks}, free_gpu_blocks={num_free_gpu_blocks}")
+        
+        if self.shared_cache:
+            # In shared cache mode, we can always swap in if we have shared blocks
+            return True
+            
+        if watermark is not None:
             return num_free_gpu_blocks - num_required_blocks >= watermark
         else:
-            return num_free_gpu_blocks - num_required_blocks >= self.watermark_blocks
+            return num_free_gpu_blocks - num_required_blocks >= self.gpu_allocator.get_num_free_blocks()
 
-    def swap_in(self, req: Request):
-        # CPU block -> GPU block.
-        for _ in range(req.num_physical_token_blocks):
-            self.gpu_allocator.allocate()
-            self.cpu_allocator.free()
+    def swap_in(self, req: Request) -> None:
+        """Swap in blocks from CPU to GPU."""
+        if self.debug:
+            print(f"swap_in: swapping in blocks for request {req.id}")
+            print(f"Number of blocks to swap in: {len(req._physical_token_blocks)}")
 
-    def remote_swap_in_swapped(self, req: Request):
-        # Other GPU block -> This GPU block.
-        for _ in range(req.num_physical_token_blocks):
-            self.cpu_allocator.allocate()
+        for block in req._physical_token_blocks:
+            if block.device == Device.CPU:
+                self.cpu_allocator.free(block.block_number)
+                block_id = self.gpu_allocator.allocate()
+                if block_id is None:
+                    raise RuntimeError("Failed to allocate GPU block")
+                block = self.gpu_blocks[block_id]
+                block.ref_count = 1
 
-    def remote_swap_in_running(self, req: Request):
-        # Other GPU block -> This GPU block.
-        for _ in range(req.num_physical_token_blocks):
-            self.gpu_allocator.allocate()
+    def remote_swap_in_swapped(self, req: Request) -> None:
+        """Handle remote swap in for swapped requests."""
+        if self.debug:
+            print(f"remote_swap_in_swapped: handling remote swap in for request {req.id}")
 
-    def can_swap_out(self, req: Request) -> bool:
-        return req.num_physical_token_blocks <= self.cpu_allocator.get_num_free_blocks()
+        for block in req._physical_token_blocks:
+            if block.device == Device.CPU:
+                self.cpu_allocator.free(block.block_number)
+                block_id = self.gpu_allocator.allocate()
+                if block_id is None:
+                    raise RuntimeError("Failed to allocate GPU block")
+                block = self.gpu_blocks[block_id]
+                block.ref_count = 1
 
-    def swap_out(self, req: Request):
-        # GPU block -> CPU block.
-        for _ in range(req.num_physical_token_blocks):
-            self.cpu_allocator.allocate()
-            self.gpu_allocator.free()
+    def remote_swap_in_running(self, req: Request) -> None:
+        """Handle remote swap in for running requests."""
+        if self.debug:
+            print(f"remote_swap_in_running: handling remote swap in for request {req.id}")
 
-    def remote_swap_out(self, req: Request):
-        # This GPU block -> Other GPU block.
-        for _ in range(req.num_physical_token_blocks):
-            self.gpu_allocator.free()
+        for block in req._physical_token_blocks:
+            if block.device == Device.CPU:
+                self.cpu_allocator.free(block.block_number)
+                block_id = self.gpu_allocator.allocate()
+                if block_id is None:
+                    raise RuntimeError("Failed to allocate GPU block")
+                block = self.gpu_blocks[block_id]
+                block.ref_count = 1
 
-    def try_allocate(self, num_to_swap_out: int):
-        for _ in range(num_to_swap_out):
-            self.gpu_allocator.allocate()
+    def swap_out(self, req: Request) -> None:
+        """Swap out blocks from GPU to CPU."""
+        if self.debug:
+            print(f"swap_out: swapping out blocks for request {req.id}")
+            print(f"Number of blocks to swap out: {len(req._physical_token_blocks)}")
+
+        for block in req._physical_token_blocks:
+            if block.device == Device.GPU:
+                self.gpu_allocator.free(block.block_number)
+                block_id = self.cpu_allocator.allocate(block.block_number)
+                if block_id is None:
+                    raise RuntimeError("Failed to allocate CPU block")
+                block = self.cpu_blocks[block_id]
+                block.ref_count = 1
+
+    def remote_swap_out(self, req: Request) -> None:
+        """Handle remote swap out."""
+        if self.debug:
+            print(f"remote_swap_out: handling remote swap out for request {req.id}")
+
+        for block in req._physical_token_blocks:
+            if block.device == Device.GPU:
+                self.gpu_allocator.free(block.block_number)
+                block_id = self.cpu_allocator.allocate(block.block_number)
+                if block_id is None:
+                    raise RuntimeError("Failed to allocate CPU block")
+                block = self.cpu_blocks[block_id]
+                block.ref_count = 1
+
+    def try_allocate(self, num_blocks: int) -> None:
+        """Try to allocate a specific number of blocks."""
+        if self.debug:
+            print(f"try_allocate: attempting to allocate {num_blocks} blocks")
+            print(f"Free GPU blocks: {self.gpu_allocator.get_num_free_blocks()}")
+
+        for _ in range(num_blocks):
+            block_id = self.gpu_allocator.allocate()
+            if block_id is None:
+                break
+
+    def get_gpu_status(self) -> tuple[int, int, int]:
+        """Get GPU memory status."""
+        free_blocks = self.gpu_allocator.get_num_free_blocks()
+        used_blocks = len(self.gpu_blocks) - free_blocks
+        total_blocks = len(self.gpu_blocks)
+        if self.debug:
+            print(f"get_gpu_status: free={free_blocks}, used={used_blocks}, total={total_blocks}")
+        return free_blocks, used_blocks, total_blocks
+
+    def free(self, req: Request) -> None:
+        """Free blocks allocated to a request."""
+        if self.debug:
+            print(f"free: freeing blocks for request {req.id}")
+            print(f"Number of blocks to free: {len(req._physical_token_blocks)}")
+
+        for block in req._physical_token_blocks:
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                if block.device == Device.GPU:
+                    self.gpu_allocator.free(block.block_number)
+                    
+                    # If using SharedMemoryCache, check if we need to remove from cache
+                    if self.shared_cache and self.shared_memory_cache and hasattr(block, 'tokens'):
+                        token_sequence = block.tokens
+                        
+                        # Check if this token sequence is still referenced by other blocks
+                        still_referenced = False
+                        if token_sequence in self.token_to_block_map:
+                            block_ids = self.token_to_block_map[token_sequence]
+                            for block_id in block_ids:
+                                if block_id != block.block_number:
+                                    other_block = self.gpu_blocks.get(block_id)
+                                    if other_block and other_block.ref_count > 0:
+                                        still_referenced = True
+                                        break
+                        
+                        # If no other blocks reference this token sequence, remove from cache
+                        if not still_referenced:
+                            if token_sequence in self.shared_memory_cache.cache:
+                                del self.shared_memory_cache.cache[token_sequence]
+                            if token_sequence in self.shared_memory_cache.lru:
+                                self.shared_memory_cache.lru.remove(token_sequence)
+                            if token_sequence in self.token_to_block_map:
+                                del self.token_to_block_map[token_sequence]
+                            
+                            #if self.debug:
+                                #print(f"Removed token sequence {token_sequence} from cache")
+                else:
+                    self.cpu_allocator.free(block.block_number)
+        req._physical_token_blocks.clear()

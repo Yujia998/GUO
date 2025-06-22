@@ -147,6 +147,8 @@ class LLMPagedAttnScheduler(LLMScheduler):
         lazy_swap: bool,
         max_parallem_sum=None,
         max_occupy_ratio: float = 1,
+        shared_cache: bool = False,
+        eviction_policy: str = "lru",  # "lru" or "lfu"
     ):
         super().__init__()
 
@@ -159,6 +161,9 @@ class LLMPagedAttnScheduler(LLMScheduler):
             block_size=self.cache_config.block_size,
             num_gpu_blocks=self.cache_config.num_gpu_blocks,
             num_cpu_blocks=self.cache_config.num_cpu_blocks,
+            shared_cache=shared_cache,
+            eviction_policy=eviction_policy,
+            debug=self.cache_config.debug,
         )
 
         self.max_occupy_ratio = max_occupy_ratio
@@ -173,24 +178,38 @@ class LLMPagedAttnScheduler(LLMScheduler):
         Return:
             A list of candidate requests for the next generation step.
         """
+        
         num_blocks_to_swap_in: int = 0
         num_blocks_to_swap_out: int = 0
 
         scheduled: list[Request] = []
+         
         if not self.swapped:
+          
             while self.waiting:
+              
                 if not self._is_occupy_below_usage():
+                    print("cant allocate waiting")
                     break
                 if self.max_parallem_sum is not None and len(self.running) >= self.max_parallem_sum:
+                    print("max parallel sum reached")
                     break
 
                 req = self.waiting[0]
-
+                #print(f"Scheduling request {req.id} (Prompt={req.prompt_len}, Gen={req.generation_len}, BlockSize={req.block_size})")
                 if not self.block_manager.can_allocate(req):
-                    # print("cant allocate waiting")
+                    required_blocks = req.num_logical_token_blocks
+                    free_blocks, used_blocks, total_blocks = self.block_manager.get_gpu_status()
+                    #print(
+                       # f"[⚠️ Skipped] Request {req.id} needs {required_blocks} blocks "
+                      #  f"but only {free_blocks} are free "
+                       # f"(Prompt={req.prompt_len}, Gen={req.generation_len}, BlockSize={req.block_size})"
+                    #)
+                    #print("cant allocate waiting")
                     break
 
                 req = self.waiting.pop(0)
+                #print(f"Allocating request {req.id} (Prompt={req.prompt_len}, Gen={req.generation_len}, BlockSize={req.block_size})")
                 self.block_manager.allocate(req)
                 req.status = RequestStatus.RUNNING
                 self.running.append(req)
