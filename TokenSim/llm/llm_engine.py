@@ -139,7 +139,7 @@ class LLMWorker(Worker):
         self.block_size = block_size
         self.swap_policy = swap_policy
         self.eviction_policy = eviction_policy
-        self.cache_config = CacheConfig(self.block_size, self.hardware, self.model, self.roofline,debug=True)
+        self.cache_config = CacheConfig(self.block_size, self.hardware, self.model, self.roofline,debug=False)
 
         self.preempted_cnt = 0
 

@@ -6,7 +6,7 @@
     "worker_groups": [
         {
             "role": "homo",
-            "hardware": "A100-40G",
+            "hardware": "NVL",
             "num_workers": 1,
             "network": "netw1"
         }
